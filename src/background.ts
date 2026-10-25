@@ -34,7 +34,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 return false; // 同步返回false表示不会异步发送响应
             }
             getCookies(msg.fieldName, msg.url).then((content) => {
-                console.log(`[background.ts] Sending cookie response for ${msg.fieldName}:`, content);
                 sendResponse({ fieldValue: content });
             }).catch(error => {
                 console.error('[background.ts] Error getting cookies:', error);
@@ -154,7 +153,6 @@ async function getCookies(fieldName: string, url: string): Promise<string | null
                 return reject(chrome.runtime.lastError);
             }
             const fieldValue = cookie ? cookie.value : null;
-            console.log(`[background.ts] Got cookie value: ${fieldValue}`);
             resolve(fieldValue);
         });
     });

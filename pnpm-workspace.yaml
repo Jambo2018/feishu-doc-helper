@@ -1,0 +1,9 @@
+# Native build steps required by the locked Plasmo/Parcel toolchain.
+# Permission is limited to these dependencies in this repository.
+allowBuilds:
+  '@parcel/watcher': true
+  '@swc/core': true
+  esbuild: true
+  lmdb: true
+  msgpackr-extract: true
+  sharp: true

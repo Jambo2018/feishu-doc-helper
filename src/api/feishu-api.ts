@@ -1,343 +1,107 @@
 import { v4 as uuidv4 } from 'uuid';
-import {getFileExtensionByObjType, getFileTypeByObjType, sleep} from '../utils/common'
-import type {
-    FeishuFile,
-    FeishuFolder,
-    WikiSpace,
-    WikiNode,
-    WikiTreeResponse,
-    FeishuApiResponse,
-    ExportTaskResponse,
-    ExportResultResponse
-} from '../types/feishu';
+import { getFileExtensionByObjType, getFileTypeByObjType, sleep } from '../utils/common';
+import { request, RequestError } from '../utils/request';
+import { collectPages, mergeExplorerPages } from '../utils/pagination';
+import type { WikiSpace, WikiTreeResponse } from '../types/feishu';
 
+type JsonResponse = { code: number; data: any; msg?: string };
+const getJson = (url: string) => request<JsonResponse>(url, { headers: { Accept: 'application/json' } });
+const endpoint = (path: string) => new URL(path, window.location.origin).href;
 
-/**
- * @description 通用的GET请求函数，用于获取JSON数据
- * @param url 请求的URL
- * @returns 返回响应的JSON数据
- */
-async function getJson(url: string) {
-    console.log(`[getJson] fetching url: ${url}`);
-    try {
-        const response = await fetch(url, {
-            method: 'GET',
-            credentials: 'include',
-            headers: {
-                'Accept': 'application/json',
-            }
-        });
-        if (!response.ok) {
-            console.error(`[getJson] HTTP error! status: ${response.status}`);
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        const data = await response.json();
-        console.log(`[getJson] received data:`, data);
-        return data;
-    } catch (error) {
-        console.error('[getJson] error:', error);
-        throw error;
+export function getCookies(fieldName: string): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
+      chrome.runtime.sendMessage({ type: 'getCookies', fieldName, url: window.location.href }, response => {
+        const error = chrome.runtime.lastError;
+        if (error || response?.error) reject(new Error(error?.message || response?.error));
+        else resolve(response?.fieldValue || null);
+      });
+    } else {
+      const entry = document.cookie.split(';').map(value => value.trim()).find(value => value.startsWith(`${fieldName}=`));
+      resolve(entry ? entry.slice(fieldName.length + 1) : null);
     }
+  });
 }
 
-/**
- * @description 从Cookie中获取指定字段的值
- * @param fieldName 要获取的Cookie字段名
- * @returns 返回Cookie字段的值，如果不存在则返回null
- */
-export async function getCookies(fieldName: string): Promise<string | null> {
-    console.log(`[getCookies] getting cookie: ${fieldName}`);
-    return new Promise((resolve) => {
-        if (chrome.runtime && chrome.runtime.sendMessage) {
-            chrome.runtime.sendMessage({
-                type: 'getCookies',
-                fieldName: fieldName,
-                url: window.location.href
-            }, (response) => {
-                if (chrome.runtime.lastError) {
-                    console.error('[getCookies] error:', chrome.runtime.lastError);
-                    resolve(null);
-                } else {
-                    const fieldValue = response?.fieldValue || null;
-                    console.log(`[getCookies] received cookie value: ${fieldValue}`);
-                    resolve(fieldValue);
-                }
-            });
-        } else {
-            console.warn('[getCookies] chrome.runtime.sendMessage is not available. Falling back to document.cookie.');
-            const cookies = document.cookie.split(';').reduce((acc, cookie) => {
-                const [key, value] = cookie.trim().split('=');
-                acc[key] = value;
-                return acc;
-            }, {});
-            const cookieValue = cookies[fieldName] || null;
-            console.log(`[getCookies] received cookie value from document.cookie: ${cookieValue}`);
-            resolve(cookieValue);
-        }
-    });
-}
-
-// ==================飞书API接口函数=================
-
-/**
- * @description 获取知识库列表
- * @returns 返回知识库空间列表
- */
 export async function fetchWikiSpaces(): Promise<WikiSpace[]> {
-    console.log('[fetchWikiSpaces] fetching wiki spaces');
-    try {
-        await sleep(500);
-        const json = await getJson(`${window.location.origin}/space/api/wiki/v2/space/get/?size=40`);
-        if (json && json.code === 0 && json.data && json.data.spaces) {
-            console.log('[fetchWikiSpaces] successfully fetched wiki spaces:', json.data.spaces);
-            return json.data.spaces;
-        }
-        console.warn('[fetchWikiSpaces] failed to fetch wiki spaces or no spaces found:', json);
-        return [];
-    } catch (error) {
-        console.error('[fetchWikiSpaces] error:', error);
-        return [];
-    }
+  const pages = await collectPages(endpoint('/space/api/wiki/v2/space/get/?size=40'), getJson);
+  const spaces = new Map<string, WikiSpace>();
+  for (const page of pages) {
+    if (!Array.isArray(page.data.spaces)) throw new Error('知识库列表结构发生变化');
+    for (const space of page.data.spaces) spaces.set(space.space_id, space);
+  }
+  return [...spaces.values()];
 }
 
-/**
- * @description 获取知识库子节点
- * @param spaceId 知识库ID
- * @param wikiToken 节点Token
- * @returns 返回知识库子节点信息
- */
-export async function fetchWikiNodeChildren(spaceId: string, wikiToken: string): Promise<WikiTreeResponse | null> {
-    console.log(`[fetchWikiNodeChildren] fetching wiki children for spaceId: ${spaceId}, wikiToken: ${wikiToken}`);
-    try {
-        await sleep(500);
-        const url = `${window.location.origin}/space/api/wiki/v2/tree/get_info/?space_id=${spaceId}&wiki_token=${wikiToken}`;
-        const json = await getJson(url);
-        console.log('[fetchWikiNodeChildren] successfully fetched wiki children:', json);
-        return json;
-    } catch (error) {
-        console.error('[fetchWikiNodeChildren] error:', error);
-        return null;
-    }
+export async function fetchWikiNodeChildren(spaceId: string, wikiToken: string): Promise<WikiTreeResponse> {
+  const params = new URLSearchParams({ space_id: spaceId, wiki_token: wikiToken });
+  const result = await getJson(endpoint(`/space/api/wiki/v2/tree/get_info/?${params}`));
+  if (!result.data?.tree?.nodes || !result.data.tree.child_map) throw new Error('知识库目录结构发生变化');
+  const paging = result.data.tree.nodes[wikiToken]?.child_paging;
+  // The bundled interface examples do not document this cursor format.
+  // Surface an incomplete scan instead of silently claiming a full backup.
+  if (paging?.has_more || paging?.hasMore) throw new Error('此知识库节点存在未读取的子页分页，当前列表可能不完整');
+  return result as WikiTreeResponse;
 }
 
-/**
- * @description 获取我的空间文件夹
- * @returns 返回我的空间文件夹数据
- */
+async function explorer(path: string) {
+  return mergeExplorerPages(await collectPages(endpoint(path), getJson));
+}
+
 export async function fetchFolders() {
-    console.log('[fetchFolders] fetching folders');
-    try {
-        await sleep(500);
-        const json = await getJson(`${window.location.origin}/space/api/explorer/v3/my_space/folder/?asc=1&rank=5&length=50`);
-        console.log('[fetchFolders] successfully fetched folders:', json.data);
-        return json.data;
-    } catch (error) {
-        console.error('[fetchFolders] error:', error);
-        return null;
-    }
+  return (await explorer('/space/api/explorer/v3/my_space/folder/?asc=1&rank=5&length=50')).data;
 }
 
-/**
- * @description 获取共享空间文件夹
- * @returns 返回共享空间文件夹数据
- */
 export async function fetchShareFolders() {
-    console.log('[fetchShareFolders] fetching share folders');
-    try {
-        await sleep(500);
-        const json = await getJson(`${window.location.origin}/space/api/explorer/v2/share/folder/list/?asc=0&rank=3&hidden=0&length=50`);
-        console.log('[fetchShareFolders] successfully fetched share folders:', json.data);
-        return json.data;
-    } catch (error) {
-        console.error('[fetchShareFolders] error:', error);
-        return null;
-    }
+  return (await explorer('/space/api/explorer/v2/share/folder/list/?asc=0&rank=3&hidden=0&length=50')).data;
 }
 
-/**
- * @description 获取子文件夹列表
- * @param obj_token 父文件夹的obj_token
- * @returns 返回子文件夹列表
- */
-export async function fetchChildrenList(obj_token: string) {
-    console.log(`[fetchChildrenList] fetching children list for obj_token: ${obj_token}`);
-    try {
-        await sleep(500);
-        const json = await getJson(`${window.location.origin}/space/api/explorer/v3/children/list/?asc=1&rank=5&token=${obj_token}`);
-        console.log('[fetchChildrenList] successfully fetched children list:', json);
-        return json;
-    } catch (error) {
-        console.error('[fetchChildrenList] error:', error);
-        return null;
-    }
+export function fetchChildrenList(token: string) {
+  return explorer(`/space/api/explorer/v3/children/list/?asc=1&rank=5&length=50&token=${encodeURIComponent(token)}`);
 }
 
-/**
- * @description 获取我的空间文件列表
- * @returns 返回我的空间文件列表
- */
-export async function fetchMySpaceFileList() {
-    console.log('[fetchMySpaceFileList] fetching my space file list');
-    try {
-        await sleep(500);
-        const json = await getJson(`${window.location.origin}/space/api/explorer/v3/my_space/obj/`);
-        console.log('[fetchMySpaceFileList] successfully fetched my space file list:', json);
-        return json;
-    } catch (error) {
-        console.error('[fetchMySpaceFileList] error:', error);
-        return null;
-    }
+export function fetchMySpaceFileList() {
+  return explorer('/space/api/explorer/v3/my_space/obj/?length=50');
 }
 
-/**
- * @description 创建导出任务
- * @param data 包含token和type的对象
- * @returns 返回导出任务的ticket，如果失败则返回null
- */
-export async function createExportTask(data: { token: string; obj_type: number }): Promise<string | null> {
-    console.log('[createExportTask] creating export task with data:', data);
-    try {
-        await sleep(500);
-        const requestId = 'bbAtOlQGYEbs-' + uuidv4().replace(/-/g, '');
-        
-        const requestData = {
-            "token": data.token,
-            "type": getFileTypeByObjType(data.obj_type),
-            "file_extension": getFileExtensionByObjType(data.obj_type),
-            "event_source": 1,
-            "need_comment": false
-        };
-        
-        let resp = await fetch(`${window.location.origin}/space/api/export/create/?synced_block_host_token=${data.token}&synced_block_host_type=${getFileTypeByObjType(data.obj_type)}`, {
-            "headers": {
-                "accept": "application/json, text/plain, */*",
-                "accept-language": "zh-CN,zh;q=0.9",
-                "content-type": "application/json",
-                "context": `${requestId};os=mac;app_version=1.0.13.3784;os_version=10.15.7;platform=web`,
-                "doc-biz": "Lark",
-                "pragma": "no-cache",
-                "request-id": requestId,
-                "rpc-persist-lane-c-lark-uid": "0",
-                "sec-ch-ua-mobile": "?0",
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-                "x-csrftoken": await getCookies('_csrf_token'),
-                "x-request-id": requestId,
-                "x-tt-trace-id": requestId
-            },
-            "referrer": window.location.href,
-            "referrerPolicy": "strict-origin-when-cross-origin",
-            "body": JSON.stringify(requestData),
-            "method": "POST",
-            "mode": "cors",
-            "credentials": "include"
-        });
-        if (!resp.ok) {
-            console.error(`[createExportTask] HTTP error! status: ${resp.status}`);
-            throw new Error(`HTTP error! status: ${resp.status}`);
-        }
-        let json = await resp.json();
-        console.log('[createExportTask] response:', json);
-        const ticket = json?.data?.ticket || null;
-        console.log(`[createExportTask] created task with ticket: ${ticket}`);
-        return ticket;
-    } catch (error) {
-        console.error('[createExportTask] error:', error);
-        return null;
-    }
+export async function createExportTask(file: { token: string; obj_type: number }): Promise<string> {
+  const type = getFileTypeByObjType(file.obj_type);
+  if (!type) throw new RequestError(`暂不支持导出此文件类型（${file.obj_type}）`);
+  const csrf = await getCookies('_csrf_token');
+  if (!csrf) throw new RequestError('未取得登录校验信息，请登录后刷新飞书页面');
+  const requestId = uuidv4();
+  const params = new URLSearchParams({ synced_block_host_token: file.token, synced_block_host_type: type });
+  const result = await request<JsonResponse>(endpoint(`/space/api/export/create/?${params}`), {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'x-csrftoken': csrf, 'request-id': requestId, 'x-request-id': requestId },
+    body: JSON.stringify({ token: file.token, type, file_extension: getFileExtensionByObjType(file.obj_type), event_source: 1, need_comment: false })
+  });
+  if (!result.data?.ticket) throw new RequestError('飞书未返回导出任务编号');
+  return result.data.ticket;
 }
 
-/**
- * @description 获取导出结果
- * @param ticket 导出任务的ticket
- * @param token 文件token
- * @param obj_type 对象类型
- * @param type 文件类型
- * @returns 返回导出结果
- */
-export async function fetchExportResult(ticket: string, obj_token: string, obj_type: number) {
-    console.log(`[fetchExportResult] fetching export result for ticket: ${ticket}`);
-    await sleep(2000);
-    if (!ticket) {
-        console.warn('[fetchExportResult] ticket is null');
-        return null;
-    }
-    try {
-        const result = await getJson(`${window.location.origin}/space/api/export/result/${ticket}?token=${obj_token}&type=${getFileTypeByObjType(obj_type)}&synced_block_host_token=${obj_token}&synced_block_host_type=${getFileTypeByObjType(obj_type)}`);
-        console.log('[fetchExportResult] successfully fetched export result:', result);
-        return result;
-    } catch (error) {
-        console.error('[fetchExportResult] error:', error);
-        return null;
-    }
+export function fetchExportResult(ticket: string, token: string, objType: number) {
+  const type = getFileTypeByObjType(objType);
+  const params = new URLSearchParams({ token, type, synced_block_host_token: token, synced_block_host_type: type });
+  return getJson(endpoint(`/space/api/export/result/${encodeURIComponent(ticket)}?${params}`));
 }
 
-/**
- * @description 等待导出结果
- * @param ticket 导出任务的ticket
- * @param token 文件token
- * @param obj_type 对象类型
- * @param fileExtension 文件类型
- * @returns 返回包含下载URL和文件类型的对象，如果失败则返回null
- */
-export async function waitForExportResult(ticket: string, token: string, obj_type: number): Promise<{ url: string; type: string } | null> {
-    console.log(`[waitForExportResult] waiting for export result for ticket: ${ticket}`);
-    let file_token;
-    let resp;
-    for (let retryCount = 0; retryCount < 15 && !file_token; retryCount++) {
-        console.log(`[waitForExportResult] retry count: ${retryCount}`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        try {
-            resp = await fetchExportResult(ticket, token, obj_type);
-            file_token = resp?.data?.result?.file_token;
-        } catch (error) {
-            console.error(`[waitForExportResult] error on retry ${retryCount}:`, error);
-        }
+export async function waitForExportResult(ticket: string, token: string, objType: number): Promise<{ url: string; type: string }> {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const response = await fetchExportResult(ticket, token, objType);
+    const result = response.data?.result;
+    if (result?.file_token) {
+      const params = new URLSearchParams({ synced_block_host_token: token, synced_block_host_type: getFileTypeByObjType(objType) });
+      return {
+        url: `https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/all/${encodeURIComponent(result.file_token)}/?${params}`,
+        type: result.file_extension || getFileExtensionByObjType(objType)
+      };
     }
-
-    if (file_token) {
-        const result = {
-            url: `https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/all/${file_token}/?synced_block_host_token=${token}&synced_block_host_type=${getFileTypeByObjType(obj_type)}`,
-            type: resp?.data?.result?.file_extension || getFileExtensionByObjType(obj_type)
-        };
-        console.log('[waitForExportResult] successfully got export result:', result);
-        return result;
-    }
-    
-    console.warn('[waitForExportResult] failed to get export result after multiple retries');
-    return null;
+    if (attempt < 29) await sleep(2000);
+  }
+  throw new RequestError('等待导出结果超时，可稍后仅重试失败文件');
 }
 
-/**
- * @description 下载文件
- * @param url 文件下载URL
- * @param type 文件类型
- * @returns 返回Blob对象，如果失败则返回null
- */
-export async function download(url: string, type?: string): Promise<Blob | null> {
-    console.log(`[download] downloading file from url: ${url}`);
-    try {
-        await sleep(500);
-        const response = await fetch(url, {
-            "headers": {},
-            "referrer": window.location.href,
-            "referrerPolicy": "strict-origin-when-cross-origin",
-            "method": "GET",
-            "mode": "cors",
-            "credentials": "include"
-        });
-        
-        if (!response.ok) {
-            console.error(`[download] HTTP error! status: ${response.status}`);
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        
-        const blob = await response.blob();
-        console.log('[download] successfully downloaded file as blob:', blob);
-        return blob;
-    } catch (error) {
-        console.error('[download] error:', error);
-        return null;
-    }
+export function download(url: string, _type?: string): Promise<Blob> {
+  return request<Blob>(url, { method: 'GET' }, 'blob');
 }

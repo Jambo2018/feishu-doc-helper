@@ -1,9 +1,11 @@
-import React, { useState, useEffect } from 'react';
-import { Card, Typography, Button, Popover, Tree } from 'antd';
+import React, { useState, useEffect, useRef } from 'react';
+import { Alert, Card, Typography, Button, Popover, Tree } from 'antd';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faBilibili, faTiktok, faWeixin } from '@fortawesome/free-brands-svg-icons';
 import { getTreeData } from '~services/export-service';
 import type { TreeDataNode } from '~types/feishu';
+import { getCacheScope, getExcludedFolders, setExcludedFolders } from './services/document-cache';
+import { onlyFolders } from './services/roam-service';
 
 import { analytics } from './utils/baidu-analytics';
 
@@ -91,6 +93,9 @@ function SettingsPageContent() {
   console.log('SettingsPageContent: 渲染“设置”页面');
   const [treeData, setTreeData] = useState<TreeDataNode[]>([]);
   const [checkedKeys, setCheckedKeys] = useState<string[]>([]);
+  const [settingsError, setSettingsError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const settingsScope = useRef('');
 
   useEffect(() => {
     /**
@@ -100,24 +105,15 @@ function SettingsPageContent() {
       console.log('SettingsPageContent.loadData: 开始加载数据');
       try {
         // 获取树形数据
-        const data = await getTreeData();
-        setTreeData(data);
-        console.log('SettingsPageContent.loadData: 树形数据加载成功', data);
-
-        // 获取已保存的排除目录
-        chrome.storage.local.get(['roamExcludeFolder'], (result) => {
-          if (chrome.runtime.lastError) {
-            console.error('SettingsPageContent.loadData: 获取 roamExcludeFolder 失败', chrome.runtime.lastError);
-            return;
-          }
-          const { roamExcludeFolder } = result;
-          if (roamExcludeFolder && Array.isArray(roamExcludeFolder)) {
-            setCheckedKeys(roamExcludeFolder);
-            console.log('SettingsPageContent.loadData: 已保存的排除目录加载成功', roamExcludeFolder);
-          }
-        });
+        const scope = await getCacheScope();
+        const [data, excluded] = await Promise.all([getTreeData(scope), getExcludedFolders(scope)]);
+        if (await getCacheScope() !== scope) throw new Error('登录会话已变化，请重新打开设置');
+        settingsScope.current = scope;
+        setTreeData(onlyFolders(data));
+        setCheckedKeys(excluded);
+        setSettingsError('');
       } catch (error) {
-        console.error('SettingsPageContent.loadData: 加载树形数据失败', error);
+        setSettingsError((error as Error)?.message || '设置加载失败');
       }
     };
 
@@ -128,20 +124,16 @@ function SettingsPageContent() {
    * Tree 组件 check 事件处理
    * @param checkedKeysValue
    */
-  const handleTreeCheck = (checkedKeysValue: string[] | { checked: string[]; halfChecked: string[] }) => {
+  const handleTreeCheck = async (checkedKeysValue: React.Key[] | { checked: React.Key[]; halfChecked: React.Key[] }) => {
+    setSaving(true);
     try {
-      const keys = Array.isArray(checkedKeysValue) ? checkedKeysValue : checkedKeysValue.checked;
+      const keys = (Array.isArray(checkedKeysValue) ? checkedKeysValue : checkedKeysValue.checked).map(String);
+      await setExcludedFolders(keys, settingsScope.current);
       setCheckedKeys(keys);
-      chrome.storage.local.set({ 'roamExcludeFolder': keys }, () => {
-        if (chrome.runtime.lastError) {
-          console.error('handleTreeCheck: 保存 roamExcludeFolder 失败', chrome.runtime.lastError);
-        } else {
-          console.log('handleTreeCheck: roamExcludeFolder 已保存', keys);
-        }
-      });
+      setSettingsError('');
     } catch (error) {
-      console.error('handleTreeCheck: 处理 Tree check 事件时发生错误', error);
-    }
+      setSettingsError((error as Error)?.message || '设置保存失败');
+    } finally { setSaving(false); }
   };
 
   return (
@@ -149,6 +141,7 @@ function SettingsPageContent() {
       <Paragraph style={{ fontSize: '15px', padding: '5px' }}>
         选择文档漫游需要排除的目录，文档漫游时，选中目录下的文档将不会被打开。
       </Paragraph>
+      {settingsError && <Alert type="error" message={settingsError} />}
       <div style={{ 
         border: '1px solid #d9d9d9', 
         borderRadius: '6px', 
@@ -161,6 +154,7 @@ function SettingsPageContent() {
         {treeData.length > 0 ? (
           <Tree
             checkable
+            disabled={saving}
             treeData={treeData}
             checkedKeys={checkedKeys}
             onCheck={handleTreeCheck}
@@ -168,7 +162,7 @@ function SettingsPageContent() {
           />
         ) : (
           <div style={{ textAlign: 'center', color: '#999', padding: '20px' }}>
-            暂无数据，请先访问飞书文档页面
+            暂无目录，请在飞书页面打开“批量导出”加载列表
           </div>
         )}
       </div>
